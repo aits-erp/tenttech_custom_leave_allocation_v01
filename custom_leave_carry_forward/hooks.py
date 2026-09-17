@@ -10,6 +10,34 @@ app_license = "mit"
 
 # required_apps = []
 
+fixtures = [
+    {
+        "dt": "Custom Field",
+        "filters": [
+            [
+                "fieldname",
+                "in",
+                [
+                    "custom_carry_forward_from_date",
+                    "custom_carry_forward_to_date",
+                    "custom_infinite_carry_forward"
+                ]
+            ]
+        ]
+    }
+]
+
+doctype_js = {
+    "Leave Allocation": "public/js/leave_allocation.js",
+    "Leave Type": "public/js/leave_type.js"
+
+}
+
+override_doctype_class = {
+    "Leave Allocation":
+        "custom_leave_carry_forward.overrides.leave_allocation.CustomLeaveAllocation"
+}
+
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
 # 	{
