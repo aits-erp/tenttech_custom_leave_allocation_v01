@@ -184,10 +184,11 @@
 #         create_leave_ledger_entry(self, args, submit)
 
 
-
 import frappe
 
-from frappe.utils import flt, getdate
+from frappe import _
+
+from frappe.utils import flt, getdate, cint
 
 from hrms.hr.doctype.leave_allocation.leave_allocation import (
     LeaveAllocation,
@@ -200,38 +201,55 @@ from hrms.hr.doctype.leave_allocation.leave_allocation import (
 
 class CustomLeaveAllocation(LeaveAllocation):
 
-    @frappe.whitelist()
+    # =============================================================
+    # CALCULATE TOTAL LEAVES ALLOCATED
+    # =============================================================
+
+    @frappe.whitelist(methods=["POST"])
     def set_total_leaves_allocated(self):
         """
-        Custom carry-forward calculation for Casual Leave.
+        Custom carry-forward calculation for ALL Leave Types.
 
-        Other Leave Types continue using standard HRMS behavior.
+        Custom carry-forward logic applies when:
 
-        This method is used while the Leave Allocation form is being
-        filled in the browser.
+        1. Leave Allocation:
+           "Add unused leaves from previous allocations" = checked
+
+        2. Leave Type:
+           "Is Carry Forward" = checked
+
+        Custom Leave Type settings:
+
+        - custom_carry_forward_from_date
+        - custom_carry_forward_to_date
+        - custom_infinite_carry_forward
 
         IMPORTANT:
-        This method only calculates unused leaves and total leaves.
-        It must NOT update the previous Leave Allocation record here,
-        because this method can be called multiple times while entering
-        Employee, Leave Type, From Date, To Date, etc.
+
+        This method is called from the browser whenever fields
+        are changed.
+
+        Therefore this method ONLY calculates:
+
+        - Unused Leaves
+        - Total Leaves Allocated
+
+        It does NOT:
+
+        - show mandatory validation popup
+        - save the document
+        - submit the document
+        - update previous Leave Allocation
+
+        Mandatory validation is handled separately in validate().
         """
 
-        # ---------------------------------------------------------
-        # 1. Non-Casual Leave Types
-        # ---------------------------------------------------------
-        # Keep standard HRMS behavior for all other Leave Types.
-        if self.leave_type != "Casual Leave":
-            return super().set_total_leaves_allocated()
+        # =========================================================
+        # 1. No Leave Type selected
+        # =========================================================
 
-        # ---------------------------------------------------------
-        # 2. Leave Allocation Carry Forward checkbox
-        # ---------------------------------------------------------
-        # Standard field:
-        # "Add unused leaves from previous allocations"
-        #
-        # This remains the master switch.
-        if not self.carry_forward:
+        if not self.leave_type:
+
             self.unused_leaves = 0
 
             self.total_leaves_allocated = flt(
@@ -241,17 +259,47 @@ class CustomLeaveAllocation(LeaveAllocation):
 
             return
 
-        # ---------------------------------------------------------
-        # 3. Leave Type > Is Carry Forward
-        # ---------------------------------------------------------
-        # The standard Leave Type setting must also be enabled.
-        is_carry_forward = frappe.db.get_value(
-            "Leave Type",
-            self.leave_type,
-            "is_carry_forward",
+
+        # =========================================================
+        # 2. Standard Leave Allocation Carry Forward checkbox
+        # =========================================================
+        #
+        # Standard field:
+        #
+        # Add unused leaves from previous allocations
+        #
+        # This is the MASTER SWITCH.
+        # =========================================================
+
+        if not self.carry_forward:
+
+            self.unused_leaves = 0
+
+            self.total_leaves_allocated = flt(
+                self.new_leaves_allocated,
+                self.precision("total_leaves_allocated"),
+            )
+
+            # IMPORTANT:
+            # Do NOT validate here.
+            return
+
+
+        # =========================================================
+        # 3. Check Leave Type > Is Carry Forward
+        # =========================================================
+
+        is_carry_forward = cint(
+            frappe.db.get_value(
+                "Leave Type",
+                self.leave_type,
+                "is_carry_forward",
+            )
         )
+
 
         if not is_carry_forward:
+
             self.unused_leaves = 0
 
             self.total_leaves_allocated = flt(
@@ -259,39 +307,41 @@ class CustomLeaveAllocation(LeaveAllocation):
                 self.precision("total_leaves_allocated"),
             )
 
+            # IMPORTANT:
+            # Do NOT validate here.
             return
 
-        # ---------------------------------------------------------
+
+        # =========================================================
         # 4. Validate standard HRMS carry-forward configuration
-        # ---------------------------------------------------------
+        # =========================================================
+
         validate_carry_forward(self.leave_type)
 
-        # ---------------------------------------------------------
-        # 5. Find previous Leave Allocation
-        # ---------------------------------------------------------
-        # This uses the standard HRMS helper.
-        #
-        # Example:
-        #
-        # January:
-        # 01-01-2026 -> 31-01-2026
-        #
-        # February:
-        # No allocation
-        #
-        # March:
-        # 01-03-2026 -> 31-03-2026
-        #
-        # The previous January allocation can therefore be used.
-        previous_allocation = get_previous_allocation(
-            self.from_date,
-            self.leave_type,
-            self.employee,
-        )
+
+        # =========================================================
+        # 5. Get previous Leave Allocation
+        # =========================================================
+
+        previous_allocation = None
+
+        if self.employee and self.from_date:
+
+            previous_allocation = get_previous_allocation(
+                self.from_date,
+                self.leave_type,
+                self.employee,
+            )
+
+
+        # =========================================================
+        # 6. Calculate unused leaves
+        # =========================================================
 
         unused_leaves = 0
 
         if previous_allocation:
+
             unused_leaves = get_unused_leaves(
                 self.employee,
                 self.leave_type,
@@ -299,170 +349,272 @@ class CustomLeaveAllocation(LeaveAllocation):
                 previous_allocation.to_date,
             )
 
-        # ---------------------------------------------------------
-        # 6. Apply custom Carry Forward date rules
-        # ---------------------------------------------------------
+
+        # =========================================================
+        # 7. Apply custom Carry Forward rules
+        # =========================================================
+
         unused_leaves = self.apply_custom_carry_forward_rules(
             unused_leaves
         )
 
-        # ---------------------------------------------------------
-        # 7. Set Unused Leaves
-        # ---------------------------------------------------------
+
+        # =========================================================
+        # 8. Set Unused Leaves
+        # =========================================================
+
         self.unused_leaves = flt(
             unused_leaves,
             self.precision("unused_leaves"),
         )
 
-        # ---------------------------------------------------------
-        # 8. Calculate Total Leaves Allocated
-        # ---------------------------------------------------------
-        #
-        # Example:
-        #
-        # Previous unused leaves = 3
-        # New leaves allocated   = 1.5
-        #
-        # Total = 4.5
-        #
+
+        # =========================================================
+        # 9. Calculate Total Leaves Allocated
+        # =========================================================
+
         self.total_leaves_allocated = flt(
             self.unused_leaves + flt(self.new_leaves_allocated),
             self.precision("total_leaves_allocated"),
         )
 
-        # ---------------------------------------------------------
-        # 9. Apply standard maximum carry-forward limit
-        # ---------------------------------------------------------
+
+        # =========================================================
+        # 10. Apply standard maximum carry-forward limit
+        # =========================================================
+
         self.limit_carry_forward_based_on_max_allowed_leaves()
 
-        # ---------------------------------------------------------
+
+        # =========================================================
         # IMPORTANT
-        # ---------------------------------------------------------
+        # =========================================================
         #
-        # DO NOT do this here:
+        # DO NOT call:
         #
         # self.set_carry_forwarded_leaves_in_previous_allocation()
         #
-        # That method performs a database update on the previous
-        # Leave Allocation.
+        # DO NOT call mandatory validation here.
         #
-        # This calculation method is called repeatedly from the
-        # browser while the document is still being edited.
+        # This method is called repeatedly by the browser.
         #
-        # Updating the previous record here can result in:
-        #
-        # QueryDeadlockError:
-        # Record has changed since last read in table
-        # 'tabLeave Allocation'
-        #
-        # Therefore, previous allocation tracking is NOT performed
-        # during this calculation request.
+        # It must ONLY calculate values.
+        # =========================================================
 
         return
 
 
+    # =============================================================
+    # CUSTOM CARRY FORWARD DATE RULES
+    # =============================================================
+
     def apply_custom_carry_forward_rules(self, unused_leaves):
         """
-        Apply custom Leave Type carry-forward settings.
+        Apply custom Carry Forward rules:
 
-        Custom fields:
+        - Carry Forward From Date
+        - Carry Forward To Date
+        - Infinite Carry Forward
 
-        custom_carry_forward_from_date
-        custom_carry_forward_to_date
-        custom_infinite_carry_forward
+        These rules apply dynamically to ALL Leave Types
+        where Is Carry Forward is enabled.
         """
 
-        # Nothing to carry forward.
+        # ---------------------------------------------------------
+        # No unused leaves
+        # ---------------------------------------------------------
+
         if not unused_leaves:
             return 0
 
+
         # ---------------------------------------------------------
-        # Get custom Carry Forward From Date
+        # Get Carry Forward From Date
         # ---------------------------------------------------------
+
         from_date = frappe.db.get_value(
             "Leave Type",
             self.leave_type,
             "custom_carry_forward_from_date",
         )
 
+
         # ---------------------------------------------------------
-        # Get custom Carry Forward To Date
+        # Get Carry Forward To Date
         # ---------------------------------------------------------
+
         to_date = frappe.db.get_value(
             "Leave Type",
             self.leave_type,
             "custom_carry_forward_to_date",
         )
 
+
         # ---------------------------------------------------------
-        # Get Infinite Carry Forward setting
+        # Get Infinite Carry Forward
         # ---------------------------------------------------------
-        infinite = frappe.db.get_value(
-            "Leave Type",
-            self.leave_type,
-            "custom_infinite_carry_forward",
+
+        infinite = cint(
+            frappe.db.get_value(
+                "Leave Type",
+                self.leave_type,
+                "custom_infinite_carry_forward",
+            )
         )
+
+
+        # ---------------------------------------------------------
+        # If allocation date is not available
+        # ---------------------------------------------------------
+
+        if not self.from_date:
+            return flt(unused_leaves)
+
 
         allocation_date = getdate(self.from_date)
 
-        # ---------------------------------------------------------
+
+        # =========================================================
         # Carry Forward From Date
-        # ---------------------------------------------------------
-        #
-        # Example:
-        #
-        # From Date = 01-01-2026
-        #
-        # An allocation before 01-01-2026 will not receive
-        # carry-forward.
-        #
+        # =========================================================
+
         if from_date:
+
             if allocation_date < getdate(from_date):
                 return 0
 
-        # ---------------------------------------------------------
+
+        # =========================================================
         # Carry Forward To Date
-        # ---------------------------------------------------------
+        # =========================================================
         #
-        # If Infinite Carry Forward is OFF:
-        # carry-forward stops after To Date.
+        # Infinite Carry Forward = OFF
+        #     -> To Date applies
         #
-        # If Infinite Carry Forward is ON:
-        # To Date is ignored.
-        #
+        # Infinite Carry Forward = ON
+        #     -> To Date is ignored
+        # =========================================================
+
         if to_date and not infinite:
+
             if allocation_date > getdate(to_date):
                 return 0
 
+
         return flt(unused_leaves)
 
+
+    # =============================================================
+    # STANDARD HRMS VALIDATION
+    # =============================================================
+
+    def validate(self):
+        """
+        Standard HRMS validation during Save / Submit.
+
+        IMPORTANT:
+
+        set_total_leaves_allocated() is overridden because we need
+        custom browser-side carry-forward calculation.
+
+        Therefore the original HRMS mandatory validation from
+        set_total_leaves_allocated() must be performed here,
+        during document validation only.
+
+        This prevents the mandatory popup from appearing when
+        Employee, Leave Type, From Date, To Date, etc. are changed.
+        """
+
+        # =========================================================
+        # 1. Run normal HRMS Leave Allocation validation
+        # =========================================================
+
+        super().validate()
+
+
+        # =========================================================
+        # 2. Preserve standard carry-forward tracking
+        # =========================================================
+        #
+        # The original HRMS set_total_leaves_allocated() does this
+        # before the mandatory total validation.
+        #
+        # We intentionally do it here instead of during browser
+        # calculation to avoid the Record Changed / Deadlock error.
+        # =========================================================
+
+        if self.carry_forward:
+
+            self.set_carry_forwarded_leaves_in_previous_allocation()
+
+
+        # =========================================================
+        # 3. Preserve standard HRMS over-allocation validation
+        # =========================================================
+        #
+        # In your installed HRMS version, this method checks whether
+        # total allocated leaves exceed the allocation period.
+        # =========================================================
+
+        LeaveAllocation.validate_total_leaves_allocated(self)
+
+
+        # =========================================================
+        # 4. ORIGINAL HRMS MANDATORY VALIDATION
+        # =========================================================
+        #
+        # This is the exact mandatory validation from the
+        # HRMS version installed on your system.
+        #
+        # Standard HRMS has this inside its
+        # set_total_leaves_allocated().
+        #
+        # We move it here because our set_total_leaves_allocated()
+        # is also called by browser field-change events.
+        # =========================================================
+
+        if (
+            not self.total_leaves_allocated
+            and not frappe.db.get_value(
+                "Leave Type",
+                self.leave_type,
+                "is_earned_leave",
+            )
+            and not frappe.db.get_value(
+                "Leave Type",
+                self.leave_type,
+                "is_compensatory",
+            )
+        ):
+
+            frappe.throw(
+                _(
+                    "Total leaves allocated is mandatory for Leave Type {0}"
+                ).format(self.leave_type)
+            )
+
+
+    # =============================================================
+    # CREATE LEAVE LEDGER ENTRY
+    # =============================================================
 
     def create_leave_ledger_entry(self, submit=True):
         """
         Create Leave Ledger entries.
 
-        Casual Leave uses the custom carry-forward calculation.
+        Carry-forward leaves:
+            is_carry_forward = 1
 
-        Other Leave Types continue using standard HRMS behavior.
+        New allocation leaves:
+            is_carry_forward = 0
         """
 
-        # ---------------------------------------------------------
-        # 1. Non-Casual Leave Types
-        # ---------------------------------------------------------
-        if self.leave_type != "Casual Leave":
-            return super().create_leave_ledger_entry(
-                submit=submit
-            )
+        # =========================================================
+        # 1. Carry-forward ledger entry
+        # =========================================================
 
-        # ---------------------------------------------------------
-        # 2. Carry-forward ledger entry
-        # ---------------------------------------------------------
-        #
-        # If unused leaves were carried forward:
-        #
-        # is_carry_forward = 1
-        #
         if self.unused_leaves:
+
             args = dict(
                 leaves=self.unused_leaves,
                 from_date=self.from_date,
@@ -476,14 +628,11 @@ class CustomLeaveAllocation(LeaveAllocation):
                 submit,
             )
 
-        # ---------------------------------------------------------
-        # 3. Normal new allocation ledger entry
-        # ---------------------------------------------------------
-        #
-        # New leaves are stored separately:
-        #
-        # is_carry_forward = 0
-        #
+
+        # =========================================================
+        # 2. Normal allocation ledger entry
+        # =========================================================
+
         args = dict(
             leaves=self.new_leaves_allocated,
             from_date=self.from_date,
