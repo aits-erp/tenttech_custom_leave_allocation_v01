@@ -1,6 +1,3 @@
-# Copyright (c) 2026, Sukku and contributors
-# For license information, please see license.txt
-
 
 from calendar import monthrange
 from datetime import date
@@ -258,52 +255,67 @@ def get_data(filters: Filters, attendance_map: dict) -> list[dict]:
 
 
 def get_attendance_map(filters: Filters) -> dict:
-	"""Returns a dictionary of employee wise attendance map as per shifts for all the days of the month like
-	{
-	    'employee1': {
-	            'Morning Shift': {1: 'Present', 2: 'Absent', ...}
-	            'Evening Shift': {1: 'Absent', 2: 'Present', ...}
-	    },
-	    'employee2': {
-	            'Afternoon Shift': {1: 'Present', 2: 'Absent', ...}
-	            'Night Shift': {1: 'Absent', 2: 'Absent', ...}
-	    },
-	    'employee3': {
-	            None: {1: 'On Leave'}
-	    }
-	}
+	"""Return one consolidated attendance row per employee.
+
+	Historical data can contain more than one submitted Attendance document
+	for the same employee and attendance date, sometimes with one record having
+	a blank shift and another having a shift. The standard report creates one
+	row per shift, which can therefore display the same employee twice.
+
+	This implementation consolidates all records by employee + date and keeps
+	one daily status only. It also selects one representative shift per
+	employee, so the detailed report always displays one row per employee.
 	"""
 	attendance_list = get_attendance_records(filters)
+
+	# Status precedence when duplicate Attendance records exist for the same
+	# employee/date. More specific statuses take priority over generic ones.
+	status_priority = {
+		"On Leave": 50,
+		"Half Day/Other Half Present": 40,
+		"Half Day/Other Half Absent": 40,
+		"Work From Home": 30,
+		"Present": 30,
+		"Absent": 20,
+	}
+
+	employee_records = {}
+	for record in attendance_list:
+		employee = record.employee
+		attendance_date = getdate(record.attendance_date)
+		entry = employee_records.setdefault(
+			employee,
+			{"dates": {}, "shifts": {}},
+		)
+
+		shift = record.shift or ""
+		if shift:
+			entry["shifts"][shift] = entry["shifts"].get(shift, 0) + 1
+
+		current = entry["dates"].get(attendance_date)
+		if current is None or status_priority.get(record.status, 0) >= status_priority.get(current, 0):
+			entry["dates"][attendance_date] = record.status
+
 	attendance_map = {}
-	leave_map = {}
+	for employee, entry in employee_records.items():
+		# Use the most frequently used non-empty shift as the display shift.
+		# If no shift exists, retain a blank shift.
+		if entry["shifts"]:
+			display_shift = max(entry["shifts"], key=entry["shifts"].get)
+		else:
+			display_shift = ""
 
-	for d in attendance_list:
-		if d.status == "On Leave":
-			leave_map.setdefault(d.employee, {}).setdefault(d.shift, []).append(d.attendance_date)
-			continue
-
-		if d.shift is None:
-			d.shift = ""
-
-		attendance_map.setdefault(d.employee, {}).setdefault(d.shift, {})
-		attendance_map[d.employee][d.shift][d.attendance_date] = d.status
-
-	# leave is applicable for the entire day so all shifts should show the leave entry
-
-	for employee, leave_days in leave_map.items():
-		for assigned_shift, dates in leave_days.items():
-			# no attendance records exist except leaves
-			if employee not in attendance_map:
-				attendance_map.setdefault(employee, {}).setdefault(assigned_shift, {})
-
-			for d in dates:
-				for shift in attendance_map[employee].keys():
-					attendance_map[employee][shift][d] = "On Leave"
+		attendance_map[employee] = {display_shift: entry["dates"]}
 
 	return attendance_map
 
 
 def get_attendance_records(filters: Filters) -> list[dict]:
+	"""Fetch submitted attendance and remove duplicate employee/date records.
+
+	For duplicate records, a non-empty shift is preferred. If more than one
+	record still matches, the most recently modified record is selected.
+	"""
 	Attendance = frappe.qb.DocType("Attendance")
 	attendance_date_condition = get_date_condition(Attendance.attendance_date, filters)
 	status = (
@@ -318,26 +330,41 @@ def get_attendance_records(filters: Filters) -> list[dict]:
 		)
 		.else_(Attendance.status)
 	)
+
 	query = (
 		frappe.qb.from_(Attendance)
 		.select(
+			Attendance.name,
 			Attendance.employee,
 			Attendance.attendance_date,
 			(status).as_("status"),
 			Attendance.shift,
+			Attendance.modified,
 		)
 		.where(
 			(Attendance.docstatus == 1)
 			& (Attendance.company.isin(filters.companies))
-			& (attendance_date_condition)
+			& attendance_date_condition
 		)
 	)
 
 	if filters.employee:
 		query = query.where(Attendance.employee == filters.employee)
-	query = query.orderby(Attendance.employee, Attendance.attendance_date)
 
-	return query.run(as_dict=1)
+	rows = query.orderby(Attendance.employee, Attendance.attendance_date).run(as_dict=True)
+	rows.sort(key=lambda row: row.get("modified") or "", reverse=True)
+
+	# Deduplicate strictly by employee + attendance date.
+	# Prefer records having a shift; otherwise retain the first/latest record.
+	unique_records = {}
+	for row in rows:
+		key = (row.employee, getdate(row.attendance_date))
+		if key not in unique_records:
+			unique_records[key] = row
+		elif not unique_records[key].get("shift") and row.get("shift"):
+			unique_records[key] = row
+
+	return list(unique_records.values())
 
 
 def get_employee_related_details(filters: Filters) -> tuple[dict, list]:
