@@ -19,7 +19,11 @@ Per (item, warehouse) between ``from_date`` and ``to_date``:
 real valuation (FIFO / moving average, revaluations, landed cost) and is never qty x rate.
 Cancelled ledger rows (``is_cancelled = 1``) are excluded.
 
-The Total row is added by Frappe itself (Report.add_total_row = 1).
+Two views, chosen with the View filter: **Category Summary** (default, see ``category_summary.py``)
+and **Balance Listing**, described above.
+
+The Total row of the Balance Listing is added by Frappe itself (Report.add_total_row = 1).
+The Category Summary builds its own totals and tells Frappe to skip that row.
 
 Known difference to the standard report: vouchers flagged "Opening Stock" that fall *inside*
 the period are shown as inward here (standard report moves them to opening).
@@ -27,8 +31,15 @@ the period are shown as inward here (standard report moves them to opening).
 
 import frappe
 from frappe import _
-from frappe.desk.reportview import get_match_cond
 from frappe.utils import flt, getdate, nowdate
+
+from custom_leave_carry_forward.custom_leave_carry_forward.report.stock_summary_with_detailed_breakup import (
+	category_summary,
+)
+from custom_leave_carry_forward.stock_ledger import ledger_query
+
+CATEGORY_VIEW = "Category Summary"
+LISTING_VIEW = "Balance Listing"
 
 GROUP_ITEM_WH = "Item and Warehouse"
 GROUP_ITEM = "Item"
@@ -41,6 +52,8 @@ SUM_FIELDS = ("opening_qty", "opening_val", "in_qty", "in_val", "out_qty", "out_
 
 def execute(filters=None):
 	filters = frappe._dict(filters or {})
+	if (filters.get("view") or CATEGORY_VIEW) != LISTING_VIEW:
+		return category_summary.execute(filters)
 	validate_filters(filters)
 
 	base = get_base_rows(filters)  # one row per item + warehouse (non-zero unless requested)
@@ -62,30 +75,40 @@ def validate_filters(filters):
 
 
 def get_base_rows(filters):
-	conditions, values = get_conditions(filters)
+	ledger, values = ledger_query(
+		filters.company,
+		filters.to_date,
+		item_code=filters.get("item_code"),
+		item_group=filters.get("item_group"),
+		warehouse=filters.get("warehouse"),
+	)
 	values["from_date"] = filters.from_date or getdate("1900-01-01")
-	values["to_date"] = filters.to_date
+
+	# applied outside the ledger subquery: project would break its running balance
+	conditions = ""
+	if filters.get("stock_uom"):
+		conditions += " AND item.stock_uom = %(stock_uom)s"
+		values["stock_uom"] = filters.stock_uom
+	if filters.get("project"):
+		conditions += " AND sle.project = %(project)s"
+		values["project"] = filters.project
 
 	# One pass over a date-bounded slice of the ledger; conditional sums do the breakup.
 	rows = frappe.db.sql(
 		f"""
 		SELECT sle.item_code, MAX(item.item_name) item_name, MAX(item.item_group) item_group,
 			sle.warehouse, MAX(item.stock_uom) stock_uom,
-			SUM(CASE WHEN sle.posting_date < %(from_date)s THEN sle.actual_qty ELSE 0 END) AS opening_qty,
+			SUM(CASE WHEN sle.posting_date < %(from_date)s THEN sle.qty ELSE 0 END) AS opening_qty,
 			SUM(CASE WHEN sle.posting_date < %(from_date)s THEN sle.stock_value_difference ELSE 0 END) AS opening_val,
-			SUM(CASE WHEN sle.posting_date >= %(from_date)s AND sle.actual_qty >= 0 THEN sle.actual_qty ELSE 0 END) AS in_qty,
+			SUM(CASE WHEN sle.posting_date >= %(from_date)s AND sle.qty >= 0 THEN sle.qty ELSE 0 END) AS in_qty,
 			SUM(CASE WHEN sle.posting_date >= %(from_date)s AND sle.stock_value_difference >= 0 THEN sle.stock_value_difference ELSE 0 END) AS in_val,
-			SUM(CASE WHEN sle.posting_date >= %(from_date)s AND sle.actual_qty < 0 THEN -sle.actual_qty ELSE 0 END) AS out_qty,
+			SUM(CASE WHEN sle.posting_date >= %(from_date)s AND sle.qty < 0 THEN -sle.qty ELSE 0 END) AS out_qty,
 			SUM(CASE WHEN sle.posting_date >= %(from_date)s AND sle.stock_value_difference < 0 THEN -sle.stock_value_difference ELSE 0 END) AS out_val,
-			SUM(sle.actual_qty) AS bal_qty,
+			SUM(sle.qty) AS bal_qty,
 			SUM(sle.stock_value_difference) AS bal_val
-		FROM `tabStock Ledger Entry` sle
+		FROM ({ledger}) sle
 		INNER JOIN `tabItem` item ON item.name = sle.item_code
-		WHERE sle.is_cancelled = 0
-			AND sle.docstatus < 2
-			AND sle.company = %(company)s
-			AND sle.posting_date <= %(to_date)s
-			{conditions}
+		WHERE 1 = 1 {conditions}
 		GROUP BY sle.item_code, sle.warehouse
 		ORDER BY sle.item_code, sle.warehouse
 		""",
@@ -121,35 +144,6 @@ def group_rows(base, group_by):
 	for g in rows:
 		g.val_rate = g.bal_val / g.bal_qty if g.bal_qty else 0.0
 	return sorted(rows, key=lambda g: str(g[key]))
-
-
-def get_conditions(filters):
-	cond, values = "", {"company": filters.company}
-
-	if filters.get("item_code"):
-		cond += " AND sle.item_code = %(item_code)s"
-		values["item_code"] = filters.item_code
-	if filters.get("stock_uom"):
-		cond += " AND item.stock_uom = %(stock_uom)s"
-		values["stock_uom"] = filters.stock_uom
-	if filters.get("project"):
-		cond += " AND sle.project = %(project)s"
-		values["project"] = filters.project
-	if filters.get("item_group"):
-		lft, rgt = frappe.db.get_value("Item Group", filters.item_group, ["lft", "rgt"]) or (0, 0)
-		cond += """ AND item.item_group IN (
-			SELECT name FROM `tabItem Group` WHERE lft >= %(ig_lft)s AND rgt <= %(ig_rgt)s)"""
-		values.update(ig_lft=lft, ig_rgt=rgt)
-	if filters.get("warehouse"):
-		# a group warehouse includes all of its children
-		lft, rgt = frappe.db.get_value("Warehouse", filters.warehouse, ["lft", "rgt"]) or (0, 0)
-		cond += """ AND sle.warehouse IN (
-			SELECT name FROM `tabWarehouse` WHERE lft >= %(wh_lft)s AND rgt <= %(wh_rgt)s)"""
-		values.update(wh_lft=lft, wh_rgt=rgt)
-
-	# User Permissions (company, item, warehouse ...) - ref_doctype is Stock Ledger Entry
-	cond += get_match_cond("Stock Ledger Entry")
-	return cond, values
 
 
 def get_columns(filters):

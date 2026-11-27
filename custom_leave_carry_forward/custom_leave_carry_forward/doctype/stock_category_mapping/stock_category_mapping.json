@@ -1,0 +1,50 @@
+{
+ "actions": [],
+ "allow_import": 1,
+ "autoname": "field:item_group",
+ "creation": "2026-11-26 17:30:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["item_group", "category"],
+ "fields": [
+  {
+   "description": "Sub-groups use this category too, unless they have their own mapping.",
+   "fieldname": "item_group",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Item Group",
+   "options": "Item Group",
+   "reqd": 1,
+   "set_only_once": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "category",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Stock Summary Category",
+   "options": "Raw Material\nSemi Finished Goods\nFinished Goods\nPacking Material",
+   "reqd": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-11-26 17:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "custom_leave_carry_forward",
+ "name": "Stock Category Mapping",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "export": 1, "import": 1, "read": 1, "report": 1, "role": "System Manager", "write": 1},
+  {"create": 1, "delete": 1, "export": 1, "import": 1, "read": 1, "report": 1, "role": "Stock Manager", "write": 1},
+  {"read": 1, "role": "Stock User"},
+  {"read": 1, "role": "Manufacturing Manager"},
+  {"read": 1, "role": "Accounts Manager"}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
